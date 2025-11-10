@@ -1,4 +1,4 @@
-# HW3
+# HW4
 # Wesley Junkins
 # Jesse Seidel
 # Austin Smith
@@ -30,9 +30,24 @@ class Walk(Node):
             self.sensor_callback, 
             10
         )
-
         self.mode = "FULL"
-        
+        #Variables for robot spinning 
+        self.forceSpin = True 
+        self.start_spin_time = 120 #The time in seconds befores the robot begins spinning randomly.
+        self.last_spin_time = time.time(); 
+        self.spin_rate = 20 #Time in seconds between spins. 
+        self.spin_velo = 0.5 #Angular velocity in rad/sec. 
+
+    def spin(self): 
+        spin_time = float((2 * math.pi) / (self.spin_velo) + float(random.randint(0, 1)))
+        temp_time = time.time()
+        #Wait to spin 
+        while(time.time() < temp_time + spin_time): 
+            twist_msg = Twist()
+            twist_msg.linear.x = 0.0
+            twist_msg.angular.z = self.spin_velo 
+            self.publisher.publish(twist_msg)
+         
     # Scan the front 180 degrees of lidar range and calculate angular velocity needed to go in the direction of more openness
     def scan_area(self, laser_data):
         # Get the front 180 degrees of lidar range
@@ -161,6 +176,13 @@ class Walk(Node):
         return angular_velocity, linear_velocity
 
     def sensor_callback(self, msg):
+        #Tell the robot to spin based off of the spin rate. 
+        print(time.time())
+        if (time.time() >= self.last_spin_time + self.spin_rate and time.time() >= self.startTime + self.start_spin_time) or (self.forceSpin):
+            self.forceSpin = False  
+            self.spin() 
+            self.last_spin_time = time.time() 
+    
         # Get lidar data and calculate velocities using our scan_area function
         angular_velocity, linear_velocity = self.scan_area(msg)
         
