@@ -33,10 +33,17 @@ class Walk(Node):
         self.mode = "FULL"
         #Variables for robot spinning 
         self.forceSpin = True 
-        self.start_spin_time = 120 #The time in seconds befores the robot begins spinning randomly.
+        self.start_spin_time = 60 #The time in seconds befores the robot begins spinning randomly.
         self.last_spin_time = time.time(); 
         self.spin_rate = 20 #Time in seconds between spins. 
         self.spin_velo = 0.5 #Angular velocity in rad/sec. 
+        self.exploration_period = 25.0  # WES ADDED
+        self.exploration_duration = 5.0  # WES ADDED
+        self.exploration_end_time = self.startTime  # WES ADDED
+        self.next_exploration_time = self.startTime + self.exploration_period  # WES ADDED
+        self.exploration_turn_bias = 0.3  # WES ADDED
+        self.heading_bias_end = self.startTime  # WES ADDED
+        self.heading_bias_rate = 0.0  # WES ADDED
 
     def spin(self): 
         spin_time = float((2 * math.pi) / (self.spin_velo) + float(random.randint(0, 1)))
@@ -47,6 +54,7 @@ class Walk(Node):
             twist_msg.linear.x = 0.0
             twist_msg.angular.z = self.spin_velo 
             self.publisher.publish(twist_msg)
+        self.initialize_heading_bias()  # WES ADDED
          
     # Scan the front 180 degrees of lidar range and calculate angular velocity needed to go in the direction of more openness
     def scan_area(self, laser_data):
@@ -56,36 +64,47 @@ class Walk(Node):
         start_index = middle_index - 90
         end_index = middle_index + 90
         lidar_front_180 = laser_ranges[start_index:end_index]
+        exploring = self.update_exploration_state()  # WES ADDED
         
         # Check if we can go straight through a 20-degree cone
-        cone_clear = self.check_front_cone_clear(laser_ranges, middle_index)
+        cone_clear = self.check_front_cone_clear(laser_ranges, middle_index, exploring)  # WES ADDED
         
         if cone_clear:
             # Use 70-degree cone for fine adjustments
             self.mode = "CONE"
-            angular_velocity, linear_velocity = self.calculate_cone_velocity(laser_ranges, middle_index)
+            angular_velocity, linear_velocity = self.calculate_cone_velocity(laser_ranges, middle_index, exploring)  # WES ADDED
         else:
             # Use 180-degree bias for obstacle avoidance
             self.mode = "FULL"
-            angular_velocity, linear_velocity = self.calculate_180_degree_velocity(lidar_front_180)
+            angular_velocity, linear_velocity = self.calculate_180_degree_velocity(lidar_front_180, exploring)  # WES ADDED
         
+        angular_velocity, heading_active = self.apply_heading_bias(angular_velocity)  # WES ADDED
+        if heading_active and linear_velocity > 0.0:  # WES ADDED
+            linear_velocity = max(0.2, linear_velocity - 0.05)  # WES ADDED
         return angular_velocity, linear_velocity
+    
+    def update_exploration_state(self):  # WES ADDED
+        current_time = time.time()  # WES ADDED
+        if current_time >= self.next_exploration_time:  # WES ADDED
+            self.exploration_end_time = current_time + self.exploration_duration  # WES ADDED
+            self.next_exploration_time = current_time + self.exploration_period  # WES ADDED
+        return current_time < self.exploration_end_time  # WES ADDED
         
-    def check_front_cone_clear(self, laser_ranges, middle_index):
+    def check_front_cone_clear(self, laser_ranges, middle_index, exploring=False):  # WES ADDED
         # Check 70-degree cone in the center (35 degrees on each side)
         cone_start = middle_index - 35
         cone_end = middle_index + 35
         cone_data = laser_ranges[cone_start:cone_end]
         
         # Check if there's clear space (2 meters) in the front cone
-        clear_distance = 2.0  # meters
+        clear_distance = 1.5 if exploring else 2.0  # WES ADDED
         max_distance_in_cone = np.mean(cone_data)
         
         # Return True if there's at least one clear path (2+ meters) in the cone
         # This allows us to detect doors even if part of the cone faces a wall
         return max_distance_in_cone > clear_distance
         
-    def calculate_cone_velocity(self, laser_ranges, middle_index):
+    def calculate_cone_velocity(self, laser_ranges, middle_index, exploring=False):  # WES ADDED
         # Get 90-degree cone data (45 degrees on each side of center)
         cone_start = middle_index - 45
         cone_end = middle_index + 45
@@ -101,6 +120,10 @@ class Walk(Node):
         
         # Calculate bias for fine adjustments
         bias = right_openness - left_openness
+        exploratory_turn = 0.0  # WES ADDED
+        if exploring:  # WES ADDED
+            bias *= 0.4  # WES ADDED
+            exploratory_turn = self.exploration_turn_bias * random.uniform(-1.0, 1.0)  # WES ADDED
         
         # Angular velocity calculation (fine adjustments)
         max_angular_vel = 0.4  # Much smaller than 180-degree version
@@ -109,6 +132,7 @@ class Walk(Node):
             angular_velocity = bias * random.betavariate(0.3, 0.3) 
         else:  
             angular_velocity = bias * scale_factor 
+        angular_velocity += exploratory_turn  # WES ADDED
         
         # Limit the angular velocity for fine adjustments
         if angular_velocity > max_angular_vel:
@@ -130,10 +154,12 @@ class Walk(Node):
             linear_velocity = 0.5
         else:
             linear_velocity = base_linear_vel
+        if exploring and min_distance_in_cone > 0.7:  # WES ADDED
+            linear_velocity = min(linear_velocity + 0.1, base_linear_vel + 0.2)  # WES ADDED
             
         return angular_velocity, linear_velocity
         
-    def calculate_180_degree_velocity(self, front_180_data):
+    def calculate_180_degree_velocity(self, front_180_data, exploring=False):  # WES ADDED
         # Split the 180 degrees into left and right halves
         left_half = front_180_data[:90]
         right_half = front_180_data[90:]
@@ -144,11 +170,15 @@ class Walk(Node):
         
         # Calculate bias: positive means turn right, negative means turn left
         bias = right_openness - left_openness
+        if exploring:  # WES ADDED
+            bias *= 0.5  # WES ADDED
         
         # Angular velocity calculation
         max_angular_vel = 1.0  # Maximum angular velocity
         scale_factor = 0.5      # How sensitive the turning is
         angular_velocity = bias * scale_factor
+        if exploring:  # WES ADDED
+            angular_velocity += self.exploration_turn_bias * random.uniform(-0.8, 0.8)  # WES ADDED
         
         # Limit the angular velocity to prevent excessive turning
         if angular_velocity > max_angular_vel:
@@ -172,8 +202,25 @@ class Walk(Node):
             linear_velocity = 0.5
         else:
             linear_velocity = base_linear_vel
+        if exploring and min_distance > 0.6:  # WES ADDED
+            linear_velocity = min(linear_velocity + 0.1, base_linear_vel)  # WES ADDED
             
         return angular_velocity, linear_velocity
+    
+    def initialize_heading_bias(self):  # WES ADDED
+        target_angle = random.uniform(-math.pi, math.pi)  # WES ADDED
+        bias_magnitude = random.uniform(0.25, 0.6)  # WES ADDED
+        duration = abs(target_angle) / bias_magnitude if bias_magnitude > 0 else 0.0  # WES ADDED
+        direction = 1.0 if target_angle >= 0 else -1.0  # WES ADDED
+        self.heading_bias_rate = bias_magnitude * direction  # WES ADDED
+        self.heading_bias_end = time.time() + duration  # WES ADDED
+    
+    def apply_heading_bias(self, angular_velocity):  # WES ADDED
+        current_time = time.time()  # WES ADDED
+        if current_time < self.heading_bias_end:  # WES ADDED
+            return angular_velocity + self.heading_bias_rate, True  # WES ADDED
+        self.heading_bias_rate = 0.0  # WES ADDED
+        return angular_velocity, False  # WES ADDED
 
     def sensor_callback(self, msg):
         #Tell the robot to spin based off of the spin rate. 
