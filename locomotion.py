@@ -7,12 +7,9 @@
 import rclpy
 from rclpy.node import Node
 import time
-import math
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
-from enum import Enum 
 import numpy as np 
-import random 
 from apriltag_msgs.msg import AprilTagDetectionArray
 from rclpy.qos import qos_profile_sensor_data
 
@@ -32,100 +29,23 @@ class Walk(Node):
             self.sensor_callback, 
             qos_profile_sensor_data
         )
-        self.mode = "FULL"
+        self.mode = "NAVIGATE"  # NAVIGATE or SCAN
         #April tag Subscription. 
         self.subscription = self.create_subscription(AprilTagDetectionArray, '/detections', self.listener_callback, 1)
         self.subscription  # prevent unused variable warning
+        
+        # Scanning mode variables
+        self.scan_interval = 10.0  # Time in seconds between scans
+        self.last_scan_time = time.time()
+        self.scan_duration = 5.0  # Time to complete 360 degree scan
+        self.scan_start_time = None
+        self.scan_angular_velocity = 0.5  # Angular velocity for scanning (rad/s)
 
     def listener_callback(self, msg):
         if len(msg.detections) > 0:
             print("Tag detected %s" % (msg.detections[0].id))
         
-    # Scan the front 180 degrees of lidar range and calculate angular velocity needed to go in the direction of more openness
-    def scan_area(self, laser_data):
-        # Get the front 180 degrees of lidar range
-        laser_ranges = np.array(laser_data.ranges)
-        middle_index = len(laser_ranges) // 2
-        start_index = middle_index - 90
-        end_index = middle_index + 90
-        lidar_front_180 = laser_ranges[start_index:end_index]
-        
-        # Check if we can go straight through a 20-degree cone
-        cone_clear = self.check_front_cone_clear(laser_ranges, middle_index)
-        
-        if cone_clear:
-            # Use 70-degree cone for fine adjustments
-            self.mode = "CONE"
-            angular_velocity, linear_velocity = self.calculate_cone_velocity(laser_ranges, middle_index)
-        else:
-            # Use 180-degree bias for obstacle avoidance
-            self.mode = "FULL"
-            angular_velocity, linear_velocity = self.calculate_180_degree_velocity(lidar_front_180)
-        
-        return angular_velocity, linear_velocity
-        
-    def check_front_cone_clear(self, laser_ranges, middle_index):
-        # Check 70-degree cone in the center (35 degrees on each side)
-        cone_start = middle_index - 35
-        cone_end = middle_index + 35
-        cone_data = laser_ranges[cone_start:cone_end]
-        
-        # Check if there's clear space (2 meters) in the front cone
-        clear_distance = 2.0  # meters
-        max_distance_in_cone = np.mean(cone_data)
-        
-        # Return True if there's at least one clear path (2+ meters) in the cone
-        # This allows us to detect doors even if part of the cone faces a wall
-        return max_distance_in_cone > clear_distance
-        
-    def calculate_cone_velocity(self, laser_ranges, middle_index):
-        # Get 90-degree cone data (45 degrees on each side of center)
-        cone_start = middle_index - 45
-        cone_end = middle_index + 45
-        cone_data = laser_ranges[cone_start:cone_end]
-        
-        # Split cone into left and right halves (45 measurements each)
-        left_cone = cone_data[:45]
-        right_cone = cone_data[45:]
-        
-        # Calculate average distance for each half
-        left_openness = np.mean(left_cone)
-        right_openness = np.mean(right_cone)
-        
-        # Calculate bias for fine adjustments
-        bias = right_openness - left_openness
-        
-        # Angular velocity calculation (fine adjustments)
-        max_angular_vel = 0.4  # Much smaller than 180-degree version
-        scale_factor = 0.1     # Much more gentle for fine adjustments
-        if laser_ranges[cone_start] > 0.5 and laser_ranges[cone_end] > 0.5: 
-            angular_velocity = bias * random.betavariate(0.3, 0.3) 
-        else:  
-            angular_velocity = bias * scale_factor 
-        
-        # Limit the angular velocity for fine adjustments
-        if angular_velocity > max_angular_vel:
-            angular_velocity = max_angular_vel
-        elif angular_velocity < -max_angular_vel:
-            angular_velocity = -max_angular_vel
-        
-        # Linear velocity calculation based on cone openness
-        # Use the minimum distance in cone to determine how fast to go
-        min_distance_in_cone = np.min(cone_data)
-        
-        # Base linear velocity
-        base_linear_vel = 0.5  # Base speed when cone is clear
-        
-        # Slow down as we get closer to obstacles
-        if min_distance_in_cone < 1.0:
-            linear_velocity = 0.3
-        elif min_distance_in_cone < 2.0:
-            linear_velocity = 0.5
-        else:
-            linear_velocity = base_linear_vel
-            
-        return angular_velocity, linear_velocity
-        
+    # Use 180-degree lidar for obstacle avoidance and steering
     def calculate_180_degree_velocity(self, front_180_data):
         # Split the 180 degrees into left and right halves
         left_half = front_180_data[:90]
@@ -169,8 +89,35 @@ class Walk(Node):
         return angular_velocity, linear_velocity
 
     def sensor_callback(self, msg):
-        # Get lidar data and calculate velocities using our scan_area function
-        angular_velocity, linear_velocity = self.scan_area(msg)
+        current_time = time.time()
+        
+        # Check if we should enter scanning mode
+        if self.mode == "NAVIGATE" and (current_time - self.last_scan_time) >= self.scan_interval:
+            self.mode = "SCAN"
+            self.scan_start_time = current_time
+            if DEBUG:
+                print("Entering scan mode for April tag detection")
+        
+        # Check if we should exit scanning mode
+        if self.mode == "SCAN" and (current_time - self.scan_start_time) >= self.scan_duration:
+            self.mode = "NAVIGATE"
+            self.last_scan_time = current_time
+            if DEBUG:
+                print("Exiting scan mode, resuming navigation")
+        
+        # Handle scanning mode - rotate 360 degrees
+        if self.mode == "SCAN":
+            angular_velocity = self.scan_angular_velocity
+            linear_velocity = 0.0  # Stop forward movement during scan
+        else:
+            # Navigation mode - use 180-degree lidar for obstacle avoidance
+            laser_ranges = np.array(msg.ranges)
+            middle_index = len(laser_ranges) // 2
+            start_index = middle_index - 90
+            end_index = middle_index + 90
+            lidar_front_180 = laser_ranges[start_index:end_index]
+            
+            angular_velocity, linear_velocity = self.calculate_180_degree_velocity(lidar_front_180)
         
         # Create and send twist command
         twist_msg = Twist()
